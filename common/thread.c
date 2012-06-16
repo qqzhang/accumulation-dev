@@ -30,7 +30,7 @@ struct thread_s
 #if defined PLATFORM_WINDOWS
 DWORD static WINAPI fummy_run( void* param)
 #else
-void* static fummy_run( void* param)
+void* fummy_run( void* param)
 #endif
 {
     struct thread_s* data = (struct thread_s*)param;
