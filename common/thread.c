@@ -65,12 +65,17 @@ void thread_delete(struct thread_s* self)
 
 void thread_wait(struct thread_s* self)
 {
+    if(0 != self->fd)
+    {
 #if defined PLATFORM_WINDOWS
-    WaitForSingleObject(self->fd, INFINITE);
-    CloseHandle(self->fd);
+        WaitForSingleObject(self->fd, INFINITE);
+        CloseHandle(self->fd);
 #else
-    pthread_join(self->id, NULL);
+        pthread_join(self->id, NULL);
 #endif
+
+        self->fd = 0;
+    }
 }
 
 void thread_sleep(int milliseconds)
