@@ -67,7 +67,11 @@ void thread_pool_delete(struct thread_pool_s* self)
     self = NULL;
 }
 
-// 处理一条消息
+// TODO::线程激活时只处理一条消息
+
+// TODO::或许应该为线程池添加一个标志,表示是否一个线程激活时获取当前stack所有消息进行处理
+// TODO::还是只处理一条消息
+
 static void thread_pool_proc_onemsg(struct thread_pool_s* self)
 {
     thread_msg_fun_pt callback = self->callback;
@@ -104,13 +108,9 @@ static void thread_pool_work(void* arg)
 
             thread_cond_wait(self->cv, self->lock);
             mutex_unlock(self->lock);
+        }
 
-            thread_pool_proc_onemsg(self);
-        }
-        else
-        {
-            thread_pool_proc_onemsg(self);
-        }
+        thread_pool_proc_onemsg(self);
     }
 }
 
