@@ -1,5 +1,12 @@
 #include <stdio.h>
-#include <Windows.h>
+
+#include "platform.h"
+
+#if defined PLATFORM_WINDOWS
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #include "threadpool.h"
 #include "mutex.h"
@@ -10,7 +17,13 @@ static int counter = 0;
 
 static void showcounter()
 {
-    printf("############### ThreadID : %d\n", GetCurrentThreadId());
+    #if defined PLATFORM_WINDOWS
+printf("############### ThreadID : %d\n", GetCurrentThreadId());
+#else
+printf("############### ThreadID : %d\n", (int)pthread_self());
+#endif
+
+    
     printf("wait counter lock\n");
     mutex_lock(count_mutex);
     counter++;
@@ -23,7 +36,6 @@ static void showcounter()
 
 static void my_msg_fun(struct thread_pool_s* self, void* msg)
 {
-    //thread_sleep(1);
     showcounter();
 }
 
@@ -38,8 +50,6 @@ int main()
 
     while(1)
     {
-        //thread_sleep(1);      why
-
         if(i < 3001)
         {
             thread_pool_pushmsg(p, (void*)3);

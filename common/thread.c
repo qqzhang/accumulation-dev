@@ -22,7 +22,7 @@ struct thread_s
     void*   param;
     thread_id id;
 #if defined PLATFORM_WINDOWS
-    HANDLE  fd;
+    HANDLE  handle;
 #else
 #endif
 };
@@ -47,7 +47,7 @@ struct thread_s* thread_new(thread_fun_pt func, void* param)
         data->param = param;
 
 #if defined PLATFORM_WINDOWS
-        data->fd = CreateThread( NULL, 0, fummy_run, data, 0, (PDWORD)&(data->id));
+        data->handle = CreateThread( NULL, 0, fummy_run, data, 0, (PDWORD)&(data->id));
 #else
         pthread_create( &(data->id), 0, fummy_run, data);
 #endif
@@ -65,16 +65,17 @@ void thread_delete(struct thread_s* self)
 
 void thread_wait(struct thread_s* self)
 {
-    if(0 != self->fd)
+    if(0 != self->id)
     {
 #if defined PLATFORM_WINDOWS
-        WaitForSingleObject(self->fd, INFINITE);
-        CloseHandle(self->fd);
+        WaitForSingleObject(self->handle, INFINITE);
+        CloseHandle(self->handle);
+        self->handle = NULL;
 #else
         pthread_join(self->id, NULL);
 #endif
 
-        self->fd = 0;
+        self->id = 0;
     }
 }
 

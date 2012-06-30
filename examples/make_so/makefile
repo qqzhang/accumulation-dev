@@ -2,7 +2,7 @@ VPATH	=	../../common
 CFLAGS	=	-I./../../common/
 objects = array.o buffer.o list.o fdset.o mutex.o \
 	rwlist.o socketlibfunction.o stack.o systemlib.o \
-	thread.o timeaction.o typepool.o
+	thread.o timeaction.o typepool.o threadpool.o
 TARGET	=	common.so
 common	:	$(objects)
 	gcc -shared $(objects) -o $(TARGET) 
