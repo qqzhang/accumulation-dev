@@ -133,6 +133,7 @@ void thread_pool_stop(struct thread_pool_s* self)
     {
         int i = 0;
         self->is_run = false;
+        thread_cond_signal(self->cv);
 
         for(; i < self->work_thread_num; ++i)
         {
