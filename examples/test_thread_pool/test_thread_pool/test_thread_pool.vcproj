@@ -173,10 +173,6 @@
 			Filter="h;hpp;hxx;hm;inl;inc;xsd"
 			UniqueIdentifier="{93995380-89BD-4b04-88EB-625FBE52EBFB}"
 			>
-			<File
-				RelativePath=".\threadpool.h"
-				>
-			</File>
 		</Filter>
 		<Filter
 			Name="资源文件"
@@ -205,6 +201,10 @@
 			</File>
 			<File
 				RelativePath="..\..\..\common\threadpool.c"
+				>
+			</File>
+			<File
+				RelativePath=".\threadpool.h"
 				>
 			</File>
 		</Filter>
