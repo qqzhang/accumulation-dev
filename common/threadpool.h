@@ -14,6 +14,7 @@ void thread_pool_delete(struct thread_pool_s* self);
 
 void thread_pool_start(struct thread_pool_s* self);
 void thread_pool_stop(struct thread_pool_s* self);
+void thread_pool_wait(struct thread_pool_s* self);
 
 void thread_pool_pushmsg(struct thread_pool_s* self, void* data);
 
