@@ -39,7 +39,7 @@ struct session_s
     sock fd;
     struct buffer_s*    send_buffer;
     struct buffer_s*    recv_buffer;
-    struct mutex_s*  send_mutex;
+    struct mutex_s*  send_mutex;    // TODO::考虑换为自旋锁
     bool    send_ispending;
     char    ip[IP_SIZE];
     int port;
@@ -202,43 +202,6 @@ static bool iocp_wait_recv(struct iocp_s* iocp, struct session_s* session, struc
     return ret;
 }
 
-static bool iocp_wait_send(struct iocp_s* iocp, struct session_s* session)
-{
-    bool ret = true;
-
-    struct buffer_s* temp_buffer = session->send_buffer;
-    DWORD send_len = buffer_getreadvalidcount(temp_buffer);
-
-    if(send_len > 0 && !session->send_ispending)
-    {
-        WSABUF  out_buf = {send_len, buffer_getreadptr(temp_buffer)};
-        OVERLAPPED* ovl_p = &(((struct session_ext_s*)session->ext_data)->ovl_send.base);
-
-        ovl_p->OffsetHigh   = send_len;
-
-        if(SOCKET_ERROR == (WSASend(session->fd, &out_buf, 1, &send_len, 0, ovl_p, 0)))
-        {
-            if(sErrno == WSA_IO_PENDING)
-            {
-                // 投递成功,但设置发送挂起状态,禁止立即投递下一次send
-                session->send_ispending = true;
-                buffer_addreadpos(temp_buffer, send_len);
-            }
-            else
-            {
-                ret = false;    // 返回失败
-                send_len = 0;
-            }
-        }
-        else
-        {
-            buffer_addreadpos(temp_buffer, send_len);
-        }
-    }
-
-    return ret;
-}
-
 static bool iocp_recv_complete(struct iocp_s* iocp, struct session_s* session, struct session_ext_s* ext_p, int bytes)
 {
     struct buffer_s* temp_buffer = session->recv_buffer;
@@ -258,12 +221,77 @@ static bool iocp_recv_complete(struct iocp_s* iocp, struct session_s* session, s
     return iocp_wait_recv(iocp, session, ext_p, session->fd);
 }
 
+static bool iocp_session_senddata(struct iocp_s* self, struct session_s* session, const char* data, int len)
+{
+    bool ret = (len <= 0);  // len <= 0 时返回值直接为true
+
+    if(len > 0 && !session->send_ispending)
+    {
+        WSABUF  out_buf = {len, (char*)data};
+        OVERLAPPED* ovl_p = &(((struct session_ext_s*)session->ext_data)->ovl_send.base);
+        DWORD send_len = len;
+
+        ovl_p->OffsetHigh   = len;
+
+        if(SOCKET_ERROR == (WSASend(session->fd, &out_buf, 1, &send_len, 0, ovl_p, 0)))
+        {
+            if(sErrno == WSA_IO_PENDING)
+            {
+                session->send_ispending = true;
+                ret = true;
+            }
+        }
+        else
+        {
+            ret = true;
+        }
+    }
+
+    return ret;
+}
+
+// 包装发送函数:先发送内置缓冲区没有发送的内容,然后发送指定缓冲区内容
+static bool iocp_wrap_session_senddata(struct iocp_s* self, struct session_s* session, const char* data, int len)
+{
+    struct buffer_s* temp_buffer = session->send_buffer;
+    bool ret = true;    // 默认为成功
+    int temp_size = 0;
+
+    mutex_lock(session->send_mutex);
+
+    temp_size = buffer_getreadvalidcount(temp_buffer);
+
+    // 先投递内置缓冲区未投递的数据
+    ret = iocp_session_senddata(self, session, buffer_getreadptr(temp_buffer), temp_size);
+
+    if(ret)
+    {
+        buffer_addreadpos(temp_buffer, temp_size);
+
+        if(NULL != data)
+        {
+            ret = iocp_session_senddata(self, session, data, len);
+
+            if(!ret)
+            {
+                // 如果投递失败则将预投递的数据拷贝至内置缓冲区
+                ret = buffer_write(temp_buffer, data, len);
+            }
+        }
+    }
+
+    mutex_unlock(session->send_mutex);
+
+    return ret;
+}
+
 static bool iocp_send_complete(struct iocp_s* iocp, struct session_s* session, struct session_ext_s* ext_p, int bytes)
 {
-    bool ret = false;
+    bool ret = true;
+
     mutex_lock(session->send_mutex);
     session->send_ispending = false;
-    ret = iocp_wait_send(iocp, session);
+    ret = iocp_wrap_session_senddata(iocp, session, NULL, 0);
     mutex_unlock(session->send_mutex);
 
     return  ret;
@@ -393,7 +421,7 @@ static void iocp_startworkthreads(struct iocp_s* iocp)
     }
 }
 
-static void iocp_start(
+static void iocp_start_callback(
     struct server_s* self,
     logic_on_enter_pt enter_pt,
     logic_on_close_pt close_pt,
@@ -441,7 +469,7 @@ static void iocp_start(
     }
 }
 
-static void iocp_stop(struct server_s* self)
+static void iocp_stop_callback(struct server_s* self)
 {
     struct iocp_s* iocp = (struct iocp_s*)self;
     if(iocp->run_flag)
@@ -514,38 +542,24 @@ static void iocp_stop(struct server_s* self)
     }
 }
 
-static bool iocp_send(struct server_s* self, int index, const char* data, int len)
+static bool iocp_send_callback(struct server_s* self, int index, const char* data, int len)
 {
     bool ret = false;
     struct iocp_s* iocp = (struct iocp_s*)self;
-
     if(index >= 0 && index < iocp->max_num)
     {
         struct session_s* session = iocp->sessions+index;
-        struct buffer_s* temp_buffer = session->send_buffer;
 
-        if(session->active && !session->send_ispending)
+        if(session->active)
         {
-            mutex_lock(session->send_mutex);
-
-            if(session->active && buffer_write(temp_buffer, data, len))
-            {
-                if(buffer_getwritepos(temp_buffer) == buffer_getsize(temp_buffer))
-                {
-                    buffer_adjustto_head(temp_buffer);
-                }
-                
-                ret = iocp_wait_send(iocp, session);
-            }
-
-            mutex_unlock(session->send_mutex);
+            ret = iocp_wrap_session_senddata(iocp, session, data, len);
         }
     }
 
     return ret;
 }
 
-static void iocp_closesession(struct server_s* self, int index)
+static void iocp_closesession_callback(struct server_s* self, int index)
 {
     struct iocp_s* iocp = (struct iocp_s*)self;
     iocp_session_reset(iocp, iocp->sessions+index);
@@ -560,10 +574,10 @@ struct server_s* iocp_create(
     struct iocp_s* iocp = (struct iocp_s*)malloc(sizeof(struct iocp_s));
     memset(iocp, 0, sizeof(*iocp));
 
-    iocp->base.start_pt = iocp_start;
-    iocp->base.stop_pt = iocp_stop;
-    iocp->base.closesession_pt = iocp_closesession;
-    iocp->base.send_pt = iocp_send;
+    iocp->base.start_pt = iocp_start_callback;
+    iocp->base.stop_pt = iocp_stop_callback;
+    iocp->base.closesession_pt = iocp_closesession_callback;
+    iocp->base.send_pt = iocp_send_callback;
 
     iocp->port = port;
     iocp->run_flag = false;
@@ -577,6 +591,6 @@ struct server_s* iocp_create(
 
 void iocp_delete(struct server_s* self)
 {
-    iocp_stop(self);
+    iocp_stop_callback(self);
     free(self);
 }
