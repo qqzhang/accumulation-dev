@@ -542,9 +542,9 @@ static void iocp_stop_callback(struct server_s* self)
     }
 }
 
-static bool iocp_send_callback(struct server_s* self, int index, const char* data, int len)
+static int iocp_send_callback(struct server_s* self, int index, const char* data, int len)
 {
-    bool ret = false;
+    int send_len = 0;
     struct iocp_s* iocp = (struct iocp_s*)self;
     if(index >= 0 && index < iocp->max_num)
     {
@@ -552,11 +552,14 @@ static bool iocp_send_callback(struct server_s* self, int index, const char* dat
 
         if(session->active)
         {
-            ret = iocp_wrap_session_senddata(iocp, session, data, len);
+            if(iocp_wrap_session_senddata(iocp, session, data, len))
+            {
+                send_len = len;
+            }
         }
     }
 
-    return ret;
+    return send_len;
 }
 
 static void iocp_closesession_callback(struct server_s* self, int index)

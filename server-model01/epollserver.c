@@ -1,0 +1,282 @@
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "stack.h"
+#include "mutex.h"
+#include "socketlibtypes.h"
+#include "socketlibfunction.h"
+#include "thread.h"
+#include "threadpool.h"
+#include "server_private.h"
+#include "buffer.h"
+
+#define EPOLL_WORKTHREAD_NUM (1)    /*  TODO:: 给与用户设置线程组个数   */
+
+struct epollserver_s;
+
+struct session_s
+{
+    struct epollserver_s*   epollserver;
+    int index;
+    sock fd;
+
+    struct mutex_s*  send_mutex;    /*  TODO::考虑换为自旋锁    */
+    struct buffer_s*    send_buffer;
+    struct buffer_s*    recv_buffer;
+};
+
+struct epollserver_s
+{
+    struct server_s base;
+    int epoll_fd;
+    int listen_port;
+
+    int session_recvbuffer_size;
+    int session_sendbuffer_size;
+
+    int max_num;
+    struct session_s*   sessions;
+
+    struct stack_s* freelist;
+    int freelist_num;
+    struct mutex_s* freelist_mutex;             /*  TODO::考虑换为自旋锁    */
+
+    struct thread_s*    listen_thread;
+    struct thread_s**  epoll_threads;           /*  epoll wait线程组    */
+    struct thread_pool_s*   recv_thread_pool;   /*  读取数据的线程池(处理epoll线程组发送的读取数据请求)  */
+};
+
+static void epoll_handle_newclient(struct epollserver_s* epollserver, sock client_fd)
+{
+    if(epollserver->freelist_num > 0)
+    {
+        struct session_s*   session = NULL;
+
+        mutex_lock(epollserver->freelist_mutex);
+
+        {
+            struct session_s** ppsession = (struct session_s**)stack_pop(epollserver->freelist);
+            if(NULL != ppsession)
+            {
+                session = *ppsession;
+                epollserver->freelist_num--;
+            }
+        }
+
+        mutex_unlock(epollserver->freelist_mutex);
+
+        if(NULL != session)
+        {
+            /*  TODO::考虑到监听线程获得新连接时,其他EPOLL线程仍然可能处理已关闭socket的数据    */
+            /*  1:epoll获取事件(包含1fd)并准备稍后处理; 2:逻辑层close 1fd对应的session ; 3:监听线程使用刚close的session作为新连接 */
+            struct server_s* server = &epollserver->base;
+            session->fd = client_fd;
+            buffer_init(session->recv_buffer);
+            buffer_init(session->send_buffer);
+
+            (*(server->logic_on_enter))(server, session->index);
+        }
+        else
+        {
+            printf("没有可用资源\n");
+        }
+    }
+}
+
+static void epoll_listen_thread(void* arg)
+{
+    struct epollserver_s* epollserver = (struct epollserver_s*)arg;
+    
+    sock client_fd = SOCKET_ERROR;
+    struct sockaddr_in socketaddress;
+    socklen_t size = sizeof(struct sockaddr);
+
+    sock listen_fd = socket_listen(epollserver->listen_port, 25);
+
+    while(true)
+    {
+        while((client_fd = accept(listen_fd, (struct sockaddr*)&socketaddress, &size)) < 0)
+        {
+            if(EINTR == sErrno)
+            {
+                continue;
+            }
+        }
+
+        if(client_fd != SOCKET_ERROR)
+        {
+            epoll_handle_newclient(epollserver, client_fd);
+        }
+    }
+}
+
+static void epoll_work_thread(void* arg)
+{
+    struct epollserver_s* epollserver = (struct epollserver_s*)arg;
+
+    for(;;)
+    {
+        /*  TODO::epoll_wait  */
+        struct session_s*   session = epollserver->sessions+(epollserver->max_num-1);
+        thread_sleep(10000);
+        
+        thread_pool_pushmsg(epollserver->recv_thread_pool, session);
+    }
+}
+
+/*  线程池消息处理函数:读取数据 */
+/*  TODO::需要考虑内置接收缓冲区已满,导致可能没有全部接受的情况(EPOLL的ET模式下只通知一下) */
+static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
+{
+    struct session_s*   session = (struct session_s*)msg;
+    struct buffer_s*    recv_buffer = session->recv_buffer;
+
+    struct server_s*    server = &(session->epollserver->base);
+    int can_recvlen = buffer_getwritevalidcount(recv_buffer);
+
+    if(can_recvlen > 0)
+    {
+        int recv_len = recv(session->fd, buffer_getwriteptr(recv_buffer), can_recvlen, 0);
+
+        if(SOCKET_ERROR == recv_len)
+        {
+            int error = sErrno;
+            perror("error:");
+            printf("errorid:%d\n", error);
+        }
+        else
+        {
+            int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), recv_len);
+            buffer_addreadpos(recv_buffer, proc_len);
+        }
+    }
+}
+
+static void epollserver_start_callback(
+    struct server_s* self,
+    logic_on_enter_pt enter_pt,
+    logic_on_close_pt close_pt,
+    logic_on_recved_pt   recved_pt
+    )
+{
+    struct epollserver_s* epollserver = (struct epollserver_s*)self;
+
+    self->logic_on_enter = enter_pt;
+    self->logic_on_close = close_pt;
+    self->logic_on_recved = recved_pt;
+
+    epollserver->freelist = stack_new(epollserver->max_num, sizeof(struct session_s*));
+    epollserver->freelist_num = epollserver->max_num;
+    epollserver->freelist_mutex = mutex_new();
+
+    epollserver->sessions = (struct session_s*)malloc(sizeof(struct session_s)*epollserver->max_num);
+    
+    {
+        int i = 0;
+        for(; i < epollserver->max_num; ++i)
+        {
+            struct session_s* session = epollserver->sessions+i;
+            session->index = i;
+            session->epollserver = epollserver;
+            session->fd = SOCKET_ERROR;
+
+            session->send_mutex = mutex_new();
+            session->send_buffer = buffer_new(epollserver->session_sendbuffer_size);
+            session->recv_buffer = buffer_new(epollserver->session_recvbuffer_size);
+
+            stack_push(epollserver->freelist, &session);
+        }
+    }
+
+    epollserver->epoll_threads = (struct thread_s**)malloc(sizeof(struct thread_s*)*EPOLL_WORKTHREAD_NUM);
+
+    {
+        int i = 0;
+        for(; i < EPOLL_WORKTHREAD_NUM; ++i)
+        {
+            epollserver->epoll_threads[i] = thread_new(epoll_work_thread, epollserver);
+        }
+    }
+
+    epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 1024);
+    thread_pool_start(epollserver->recv_thread_pool);
+
+    epollserver->listen_thread = thread_new(epoll_listen_thread, epollserver);
+}
+
+static void epollserver_stop_callback(struct server_s* self)
+{
+}
+
+static void epollserver_closesession_callback(struct server_s* self, int index)
+{
+    struct epollserver_s* epollserver = (struct epollserver_s*)self;
+    
+    if(index >= 0 && index < epollserver->max_num)
+    {
+        struct session_s* session = epollserver->sessions+index;
+        mutex_lock(epollserver->freelist_mutex);
+        
+        if(SOCKET_ERROR != session->fd)
+        {
+            socket_close(session->fd);
+            session->fd =SOCKET_ERROR; 
+            stack_push(epollserver->freelist, &session);
+            epollserver->freelist_num++;
+        }
+
+        mutex_unlock(epollserver->freelist_mutex);
+    }
+}
+
+static int epollserver_send_callback(struct server_s* self, int index, const char* data, int len)
+{
+    /*  直接发送,如果失败则放入内置缓冲区   */
+    struct epollserver_s* epollserver = (struct epollserver_s*)self;
+    int send_len = -1;
+
+    if(index >= 0 && index < epollserver->max_num)
+    {
+        struct session_s* session = epollserver->sessions+index;
+        mutex_lock(session->send_mutex);
+
+        send_len = socket_send(session->fd, data, len);
+
+        if(send_len >= 0 && send_len < len) /*  如果发送没有失败,但没有全部发完,则写入内置缓冲区 */
+        {
+            if(buffer_write(session->send_buffer, data+send_len, len-send_len))
+            {
+                send_len = len;
+            }
+        }
+
+        mutex_unlock(session->send_mutex);
+    }
+    
+    return send_len;
+}
+
+struct server_s* epollserver_create(
+    int port, 
+    int max_num,
+    int session_recvbuffer_size,
+    int session_sendbuffer_size)
+{
+    struct epollserver_s* epollserver = (struct epollserver_s*)malloc(sizeof(*epollserver));
+    memset(epollserver, 0, sizeof(*epollserver));
+
+    epollserver->sessions = NULL;
+    epollserver->max_num = max_num;
+    epollserver->listen_port = port;
+
+    epollserver->base.start_pt = epollserver_start_callback;
+    epollserver->base.stop_pt = epollserver_stop_callback;
+    epollserver->base.closesession_pt = epollserver_closesession_callback;
+    epollserver->base.send_pt = epollserver_send_callback;
+
+    epollserver->session_recvbuffer_size = session_recvbuffer_size;
+    epollserver->session_sendbuffer_size = session_sendbuffer_size;
+
+    return &epollserver->base;
+}
