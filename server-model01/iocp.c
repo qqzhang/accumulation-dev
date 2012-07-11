@@ -111,7 +111,7 @@ static bool listen_port(struct iocp_s* iocp, int port)
     return false;
 }
 
-static void iocp_session_reset(struct iocp_s* iocp, struct session_s* client)
+static void iocp_session_reset(struct session_s* client)
 {
     if(client->active)
     {
@@ -134,7 +134,6 @@ static void iocp_session_onclose(struct iocp_s* iocp, struct session_s* client)
 static void iocp_session_init(struct iocp_s* iocp, struct session_s* client)
 {
     struct session_ext_s* ext_p = NULL;
-    DWORD RecvLen = 0;
     client->fd = WSASocket(PF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED);
 
     if(client->ext_data == NULL)
@@ -178,7 +177,7 @@ static BOOL iocp_wait_accept(struct iocp_s* iocp, struct session_s* client)
     return AcceptEx(iocp->listenfd, client->fd, ext_p->addrblock, 0, ACCEPT_ADDRESS_LENGTH, ACCEPT_ADDRESS_LENGTH, NULL, (LPOVERLAPPED)&ext_p->ovl_accept_reset);
 }
 
-static bool iocp_wait_recv(struct iocp_s* iocp, struct session_s* session, struct session_ext_s*  ext_p, sock fd)
+static bool iocp_wait_recv(struct session_s* session, struct session_ext_s*  ext_p, sock fd)
 {
     bool ret = true;
     
@@ -218,10 +217,10 @@ static bool iocp_recv_complete(struct iocp_s* iocp, struct session_s* session, s
         buffer_adjustto_head(temp_buffer);
     }
 
-    return iocp_wait_recv(iocp, session, ext_p, session->fd);
+    return iocp_wait_recv(session, ext_p, session->fd);
 }
 
-static bool iocp_session_senddata(struct iocp_s* self, struct session_s* session, const char* data, int len)
+static bool iocp_session_senddata(struct session_s* session, const char* data, int len)
 {
     bool ret = (len <= 0);  // len <= 0 时返回值直接为true
 
@@ -251,7 +250,7 @@ static bool iocp_session_senddata(struct iocp_s* self, struct session_s* session
 }
 
 // 包装发送函数:先发送内置缓冲区没有发送的内容,然后发送指定缓冲区内容
-static bool iocp_wrap_session_senddata(struct iocp_s* self, struct session_s* session, const char* data, int len)
+static bool iocp_wrap_session_senddata(struct session_s* session, const char* data, int len)
 {
     struct buffer_s* temp_buffer = session->send_buffer;
     bool ret = true;    // 默认为成功
@@ -262,7 +261,7 @@ static bool iocp_wrap_session_senddata(struct iocp_s* self, struct session_s* se
     temp_size = buffer_getreadvalidcount(temp_buffer);
 
     // 先投递内置缓冲区未投递的数据
-    ret = iocp_session_senddata(self, session, buffer_getreadptr(temp_buffer), temp_size);
+    ret = iocp_session_senddata(session, buffer_getreadptr(temp_buffer), temp_size);
 
     if(ret)
     {
@@ -270,7 +269,7 @@ static bool iocp_wrap_session_senddata(struct iocp_s* self, struct session_s* se
 
         if(NULL != data)
         {
-            ret = iocp_session_senddata(self, session, data, len);
+            ret = iocp_session_senddata(session, data, len);
 
             if(!ret)
             {
@@ -291,7 +290,7 @@ static bool iocp_send_complete(struct iocp_s* iocp, struct session_s* session, s
 
     mutex_lock(session->send_mutex);
     session->send_ispending = false;
-    ret = iocp_wrap_session_senddata(iocp, session, NULL, 0);
+    ret = iocp_wrap_session_senddata(session, NULL, 0);
     mutex_unlock(session->send_mutex);
 
     return  ret;
@@ -336,9 +335,9 @@ static void iocp_accept_complete(struct iocp_s* iocp, struct session_s* session)
 
     (iocp->base.logic_on_enter)(&iocp->base, session->index);
 
-    if(!iocp_wait_recv(iocp, session, (struct session_ext_s*)session->ext_data, session->fd))
+    if(!iocp_wait_recv(session, (struct session_ext_s*)session->ext_data, session->fd))
     {
-        iocp_session_reset(iocp, session);
+        iocp_session_reset(session);
     }
 }
 
@@ -350,9 +349,8 @@ static void iocp_work_thread(void* arg)
     struct session_ext_s* ext_s = NULL;
     DWORD Bytes   = 0;
     struct iocp_s* iocp = (struct iocp_s*)arg;
-    struct server_s* server = &iocp->base;
 
-    while(true)
+    for(;;)
     {
         bool Success = GetQueuedCompletionStatus(iocp->iocp_handle, &Bytes, (PULONG_PTR)&ck_p, (LPOVERLAPPED*)&ovl_p, INFINITE);
 
@@ -552,7 +550,7 @@ static int iocp_send_callback(struct server_s* self, int index, const char* data
 
         if(session->active)
         {
-            if(iocp_wrap_session_senddata(iocp, session, data, len))
+            if(iocp_wrap_session_senddata(session, data, len))
             {
                 send_len = len;
             }
@@ -565,7 +563,7 @@ static int iocp_send_callback(struct server_s* self, int index, const char* data
 static void iocp_closesession_callback(struct server_s* self, int index)
 {
     struct iocp_s* iocp = (struct iocp_s*)self;
-    iocp_session_reset(iocp, iocp->sessions+index);
+    iocp_session_reset(iocp->sessions+index);
 }
 
 struct server_s* iocp_create(
