@@ -1,3 +1,9 @@
+#include "platform.h"
+
+#ifdef PLATFORM_LINUX
+#include <sys/epoll.h>
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -12,6 +18,8 @@
 #include "buffer.h"
 
 #define EPOLL_WORKTHREAD_NUM (1)    /*  TODO:: 给与用户设置线程组个数   */
+
+#define MAX_EVENTS (50)
 
 struct epollserver_s;
 
@@ -74,6 +82,7 @@ static void epoll_handle_newclient(struct epollserver_s* epollserver, sock clien
             session->fd = client_fd;
             buffer_init(session->recv_buffer);
             buffer_init(session->send_buffer);
+            socket_nonblock(client_fd);
 
             (*(server->logic_on_enter))(server, session->index);
         }
@@ -84,6 +93,28 @@ static void epoll_handle_newclient(struct epollserver_s* epollserver, sock clien
     }
 }
 
+static void epollserver_handle_sessionclose(struct session_s* session)
+{
+    struct epollserver_s* epollserver = session->epollserver;
+
+    mutex_lock(epollserver->freelist_mutex);
+
+    if(SOCKET_ERROR != session->fd)
+    {
+#ifdef PLATFORM_LINUX
+        epoll_ctl(epollserver->epoll_fd, EPOLL_CTL_DEL, session->fd, NULL);
+#endif
+        socket_close(session->fd);
+        session->fd = SOCKET_ERROR; 
+        stack_push(epollserver->freelist, &session);
+        epollserver->freelist_num++;
+    }
+
+    mutex_unlock(epollserver->freelist_mutex);
+
+}
+
+/*  监听线程,TODO::考虑是否在accept前等待有可用资源 */
 static void epoll_listen_thread(void* arg)
 {
     struct epollserver_s* epollserver = (struct epollserver_s*)arg;
@@ -94,7 +125,7 @@ static void epoll_listen_thread(void* arg)
 
     sock listen_fd = socket_listen(epollserver->listen_port, 25);
 
-    while(true)
+    for(;;)
     {
         while((client_fd = accept(listen_fd, (struct sockaddr*)&socketaddress, &size)) < 0)
         {
@@ -104,51 +135,140 @@ static void epoll_listen_thread(void* arg)
             }
         }
 
-        if(client_fd != SOCKET_ERROR)
+        if(SOCKET_ERROR != client_fd)
         {
             epoll_handle_newclient(epollserver, client_fd);
         }
     }
 }
 
+static int epollserver_senddata(struct session_s* session, const char* data, int len)
+{
+    int send_len = 0;
+    int oldlen = 0;
+    int oldsendlen = 0;
+    struct buffer_s*    send_buffer = session->send_buffer;
+
+    mutex_lock(session->send_mutex);
+
+    oldlen = buffer_getreadvalidcount(send_buffer);
+
+    if(oldlen > 0)  /*  优先发送内置缓冲区未发送的数据  */
+    {
+        oldsendlen = socket_send(session->fd, buffer_getreadptr(send_buffer), oldlen);
+    }
+
+    if(oldsendlen == oldlen && NULL != data)    /*  如果剩余数据全部发送完毕,才发送用户刚指定的数据 */
+    {
+        send_len = socket_send(session->fd, data, len);
+
+        if(send_len >= 0 && send_len < len) /*  如果发送没有失败,但没有全部发完,则写入内置缓冲区 */
+        {
+            if(buffer_write(session->send_buffer, data+send_len, len-send_len))
+            {
+                send_len = len;
+            }
+        }
+    }
+
+    mutex_unlock(session->send_mutex);
+
+    return send_len;
+}
+
 static void epoll_work_thread(void* arg)
 {
+    #ifdef PLATFORM_LINUX
+
     struct epollserver_s* epollserver = (struct epollserver_s*)arg;
+    struct server_s* server = &epollserver->base;
+    int nfds = 0;
+    int i = 0;
+    int epollfd = epollserver->epoll_fd;
+    struct epoll_event events[MAX_EVENTS];
+    uint32_t event_data = 0;
 
     for(;;)
     {
-        /*  TODO::epoll_wait  */
-        struct session_s*   session = epollserver->sessions+(epollserver->max_num-1);
-        thread_sleep(10000);
-        
-        thread_pool_pushmsg(epollserver->recv_thread_pool, session);
+        nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+
+        if(-1 == nfds)
+        {
+            break;
+        }
+
+        for(i = 0; i < nfds; ++i)
+        {
+            struct session_s*   session = (struct session_s*)(events[i].data.ptr);
+            event_data = events[i].events;
+
+            if(event_data & EPOLLRDHUP)
+            {
+                epollserver_handle_sessionclose(session);
+                (*server->logic_on_close)(server, session->index);
+            }
+            else
+            {
+                if(events[i].events & EPOLLIN)
+                {
+                    thread_pool_pushmsg(epollserver->recv_thread_pool, session);
+                }
+
+                if(event_data & EPOLLOUT)
+                {
+                    epollserver_senddata(session, NULL, 0);
+                }
+            }
+        }
     }
+
+    #endif
 }
 
 /*  线程池消息处理函数:读取数据 */
 /*  TODO::需要考虑内置接收缓冲区已满,导致可能没有全部接受的情况(EPOLL的ET模式下只通知一下) */
+/*  TODO::但这种可能性有多大呢?除非逻辑层太慢太慢了 */
+
 static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 {
     struct session_s*   session = (struct session_s*)msg;
     struct buffer_s*    recv_buffer = session->recv_buffer;
-
     struct server_s*    server = &(session->epollserver->base);
+
     int can_recvlen = buffer_getwritevalidcount(recv_buffer);
 
     if(can_recvlen > 0)
     {
         int recv_len = recv(session->fd, buffer_getwriteptr(recv_buffer), can_recvlen, 0);
+        bool is_close = false;
 
-        if(SOCKET_ERROR == recv_len)
+        if(0 == recv_len)
         {
-            int error = sErrno;
-            perror("error:");
-            printf("errorid:%d\n", error);
+            is_close = true;
+        }
+        else if(SOCKET_ERROR == recv_len)
+        {
+            is_close = (S_EWOULDBLOCK != sErrno);
         }
         else
         {
-            int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), recv_len);
-            buffer_addreadpos(recv_buffer, proc_len);
+            buffer_addwritepos(recv_buffer, recv_len);
+
+            {
+                int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), recv_len);
+                buffer_addreadpos(recv_buffer, proc_len);
+            }
+
+            if(buffer_getwritevalidcount(recv_buffer) <= 0) /*  如果数据全部处于尾部,则移动到头部    */
+            {
+                buffer_adjustto_head(recv_buffer);
+            }
+        }
+        
+        if(is_close)
+        {
+            epollserver_handle_sessionclose(session);
+            (*server->logic_on_close)(server, session->index);
         }
     }
 }
@@ -216,42 +336,19 @@ static void epollserver_closesession_callback(struct server_s* self, int index)
     if(index >= 0 && index < epollserver->max_num)
     {
         struct session_s* session = epollserver->sessions+index;
-        mutex_lock(epollserver->freelist_mutex);
-        
-        if(SOCKET_ERROR != session->fd)
-        {
-            socket_close(session->fd);
-            session->fd =SOCKET_ERROR; 
-            stack_push(epollserver->freelist, &session);
-            epollserver->freelist_num++;
-        }
-
-        mutex_unlock(epollserver->freelist_mutex);
+        epollserver_handle_sessionclose(session);
     }
 }
 
 static int epollserver_send_callback(struct server_s* self, int index, const char* data, int len)
 {
-    /*  直接发送,如果失败则放入内置缓冲区   */
     struct epollserver_s* epollserver = (struct epollserver_s*)self;
     int send_len = -1;
 
     if(index >= 0 && index < epollserver->max_num)
     {
         struct session_s* session = epollserver->sessions+index;
-        mutex_lock(session->send_mutex);
-
-        send_len = socket_send(session->fd, data, len);
-
-        if(send_len >= 0 && send_len < len) /*  如果发送没有失败,但没有全部发完,则写入内置缓冲区 */
-        {
-            if(buffer_write(session->send_buffer, data+send_len, len-send_len))
-            {
-                send_len = len;
-            }
-        }
-
-        mutex_unlock(session->send_mutex);
+        send_len = epollserver_senddata(session, data, len);
     }
     
     return send_len;
@@ -277,6 +374,10 @@ struct server_s* epollserver_create(
 
     epollserver->session_recvbuffer_size = session_recvbuffer_size;
     epollserver->session_sendbuffer_size = session_sendbuffer_size;
+
+#ifdef PLATFORM_LINUX
+    epollserver->epoll_fd = epoll_create(1);
+#endif
 
     return &epollserver->base;
 }
