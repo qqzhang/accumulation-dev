@@ -115,3 +115,4 @@ int array_num(struct array_s* self)
 {
     return self->element_num;
 }
+

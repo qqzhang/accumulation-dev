@@ -1,4 +1,4 @@
-﻿#ifndef _SOCKETLIBTYPES_H_INCLUDED_
+#ifndef _SOCKETLIBTYPES_H_INCLUDED_
 #define _SOCKETLIBTYPES_H_INCLUDED_
 
 #include "platform.h"
@@ -41,7 +41,7 @@ typedef SOCKET sock;
 #define S_EINTR EINTR
 #define S_ECONNABORTED ECONNABORTED
 typedef int sock;
-#define SOCKET_ERROR -1
+#define SOCKET_ERROR (-1)
 
 #endif
 

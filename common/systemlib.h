@@ -1,4 +1,4 @@
-﻿#ifndef _SYSTEMLIB_H
+#ifndef _SYSTEMLIB_H
 #define _SYSTEMLIB_H
 
 #ifdef  __cplusplus

@@ -108,3 +108,4 @@ int stack_top(struct stack_s* self)
 {
     return self->top;
 }
+

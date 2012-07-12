@@ -1,4 +1,4 @@
-﻿#ifndef _PLATFORM_H
+#ifndef _PLATFORM_H
 #define _PLATFORM_H
 
 #if defined _MSC_VER || defined __MINGW32__

@@ -1,4 +1,4 @@
-﻿#ifndef _FDSET_INCLUDED_H
+#ifndef _FDSET_INCLUDED_H
 #define _FDSET_INCLUDED_H
 
 #include <stdbool.h>

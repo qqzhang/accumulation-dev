@@ -124,3 +124,4 @@ void thread_cond_signal(struct thread_cond_s* self)
     pthread_cond_signal(&self->cond);
 #endif
 }
+

@@ -104,7 +104,6 @@ static void thread_pool_work(void* arg)
 {
     struct thread_pool_s* self = (struct thread_pool_s*)arg;
     struct stack_s* msg_list = self->msg_list;
-    thread_msg_fun_pt callback = self->callback;
     int thread_index = 0;
     bool* thread_state = self->work_thread_state;
 
@@ -112,7 +111,7 @@ static void thread_pool_work(void* arg)
     thread_index = self->thread_index++;
     mutex_unlock(self->thread_index_lock);
 
-    while(true)
+    for(;;)
     {
         if(stack_top(msg_list) <= 0)
         {
@@ -209,7 +208,7 @@ static bool thread_pool_isbusy(struct thread_pool_s* self)
 void thread_pool_wait(struct thread_pool_s* self)
 {
     // 循环等待线程池,直到其处于非忙状态
-    while(true)
+    for(;;)
     {
         if(!thread_pool_isbusy(self))
         {

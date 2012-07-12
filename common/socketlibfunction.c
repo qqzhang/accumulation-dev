@@ -1,4 +1,4 @@
-﻿#include "socketlibfunction.h"
+#include "socketlibfunction.h"
 
 #if defined PLATFORM_WINDOWS
 static WSADATA g_WSAData;
