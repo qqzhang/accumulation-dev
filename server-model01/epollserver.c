@@ -2,6 +2,9 @@
 
 #ifdef PLATFORM_LINUX
 #include <sys/epoll.h>
+#ifndef EPOLLRDHUP
+    #define EPOLLRDHUP (0x2000)
+    #endif
 #endif
 
 #include <stdlib.h>
@@ -55,6 +58,18 @@ struct epollserver_s
     struct thread_pool_s*   recv_thread_pool;   /*  读取数据的线程池(处理epoll线程组发送的读取数据请求)  */
 };
 
+#ifdef PLATFORM_LINUX
+static void epoll_add_event(struct epollserver_s* epollserver, sock fd, struct session_s* client, uint32_t events)
+{
+    struct epoll_event ev = { 0, { 0 }};
+    ev.events = events;
+
+    ev.data.fd = fd;
+    ev.data.ptr = client;
+    epoll_ctl(epollserver->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+}
+#endif
+
 static void epoll_handle_newclient(struct epollserver_s* epollserver, sock client_fd)
 {
     if(epollserver->freelist_num > 0)
@@ -83,6 +98,10 @@ static void epoll_handle_newclient(struct epollserver_s* epollserver, sock clien
             buffer_init(session->recv_buffer);
             buffer_init(session->send_buffer);
             socket_nonblock(client_fd);
+
+            #ifdef PLATFORM_LINUX
+            epoll_add_event(epollserver, client_fd, session, EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+            #endif
 
             (*(server->logic_on_enter))(server, session->index);
         }
@@ -156,6 +175,11 @@ static int epollserver_senddata(struct session_s* session, const char* data, int
     if(oldlen > 0)  /*  优先发送内置缓冲区未发送的数据  */
     {
         oldsendlen = socket_send(session->fd, buffer_getreadptr(send_buffer), oldlen);
+
+        if(oldsendlen > 0)
+        {
+            buffer_addwritepos(send_buffer, oldsendlen);
+        }
     }
 
     if(oldsendlen == oldlen && NULL != data)    /*  如果剩余数据全部发送完毕,才发送用户刚指定的数据 */
@@ -192,6 +216,7 @@ static void epoll_work_thread(void* arg)
     {
         nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
 
+        printf("recv %d event\n", nfds);
         if(-1 == nfds)
         {
             break;
@@ -204,12 +229,13 @@ static void epoll_work_thread(void* arg)
 
             if(event_data & EPOLLRDHUP)
             {
+                printf("client disconnet \n");
                 epollserver_handle_sessionclose(session);
                 (*server->logic_on_close)(server, session->index);
             }
             else
             {
-                if(events[i].events & EPOLLIN)
+                if(event_data & EPOLLIN)
                 {
                     thread_pool_pushmsg(epollserver->recv_thread_pool, session);
                 }
@@ -235,41 +261,52 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
     struct buffer_s*    recv_buffer = session->recv_buffer;
     struct server_s*    server = &(session->epollserver->base);
 
-    int can_recvlen = buffer_getwritevalidcount(recv_buffer);
+    bool is_close = false;
 
-    if(can_recvlen > 0)
+    /*  循环读取:直到产生S_EWOULDBLOCK,或者recv失败 */
+    for(;;)
     {
-        int recv_len = recv(session->fd, buffer_getwriteptr(recv_buffer), can_recvlen, 0);
-        bool is_close = false;
+        int can_recvlen = 0;
+        int recv_len = 0;
 
+        if(buffer_getwritevalidcount(recv_buffer) <= 0) /*  如果数据全部处于尾部,则移动到头部    */
+        {
+            buffer_adjustto_head(recv_buffer);
+        }
+
+        can_recvlen = buffer_getwritevalidcount(recv_buffer);
+
+        if(can_recvlen <= 0)
+        {
+            break;  /*  TODO::见函数声明的注释  */
+        }
+
+        recv_len = recv(session->fd, buffer_getwriteptr(recv_buffer), can_recvlen, 0);
         if(0 == recv_len)
         {
             is_close = true;
+            break;
         }
         else if(SOCKET_ERROR == recv_len)
         {
             is_close = (S_EWOULDBLOCK != sErrno);
+            break;
         }
         else
         {
             buffer_addwritepos(recv_buffer, recv_len);
-
-            {
-                int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), recv_len);
-                buffer_addreadpos(recv_buffer, proc_len);
-            }
-
-            if(buffer_getwritevalidcount(recv_buffer) <= 0) /*  如果数据全部处于尾部,则移动到头部    */
-            {
-                buffer_adjustto_head(recv_buffer);
-            }
         }
-        
-        if(is_close)
-        {
-            epollserver_handle_sessionclose(session);
-            (*server->logic_on_close)(server, session->index);
-        }
+    }
+
+    if(is_close)
+    {
+        epollserver_handle_sessionclose(session);
+        (*server->logic_on_close)(server, session->index);
+    }
+    else
+    {
+        int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), buffer_getreadvalidcount(recv_buffer));
+        buffer_addreadpos(recv_buffer, proc_len);
     }
 }
 
