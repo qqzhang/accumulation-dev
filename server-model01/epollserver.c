@@ -20,7 +20,7 @@
 #include "server_private.h"
 #include "buffer.h"
 
-#define EPOLL_WORKTHREAD_NUM (1)    /*  TODO:: ¸øÓëÓÃ»§ÉèÖÃÏß³Ì×é¸öÊı   */
+#define EPOLL_WORKTHREAD_NUM (1)    /*  epoll_waitçº¿ç¨‹ä¸ªæ•°; recvçº¿ç¨‹æ± çš„å·¥ä½œçº¿ç¨‹ä¸ªæ•°  */
 
 #define MAX_EVENTS (50)
 
@@ -32,7 +32,8 @@ struct session_s
     int index;
     sock fd;
 
-    struct mutex_s*  send_mutex;    /*  TODO::¿¼ÂÇ»»Îª×ÔĞıËø    */
+    bool    can_send;               /*  æ˜¯å¦å¯å†™    */
+    struct mutex_s*  send_mutex;    /*  TODO::è€ƒè™‘ä½¿ç”¨è‡ªæ—‹é”   */
     struct buffer_s*    send_buffer;
     struct buffer_s*    recv_buffer;
 };
@@ -51,11 +52,11 @@ struct epollserver_s
 
     struct stack_s* freelist;
     int freelist_num;
-    struct mutex_s* freelist_mutex;             /*  TODO::¿¼ÂÇ»»Îª×ÔĞıËø    */
+    struct mutex_s* freelist_mutex;             /*  TODO::è€ƒè™‘ä½¿ç”¨è‡ªæ—‹é”   */
 
     struct thread_s*    listen_thread;
-    struct thread_s**  epoll_threads;           /*  epoll waitÏß³Ì×é    */
-    struct thread_pool_s*   recv_thread_pool;   /*  ¶ÁÈ¡Êı¾İµÄÏß³Ì³Ø(´¦ÀíepollÏß³Ì×é·¢ËÍµÄ¶ÁÈ¡Êı¾İÇëÇó)  */
+    struct thread_s**  epoll_threads;           /*  epoll_waitçº¿ç¨‹ç»„   */
+    struct thread_pool_s*   recv_thread_pool;   /*  recvçº¿ç¨‹æ± (å¤„ç†epoll_waitçš„å¯è¯»äº‹ä»¶) */
 };
 
 #ifdef PLATFORM_LINUX
@@ -91,23 +92,22 @@ static void epoll_handle_newclient(struct epollserver_s* epollserver, sock clien
 
         if(NULL != session)
         {
-            /*  TODO::¿¼ÂÇµ½¼àÌıÏß³Ì»ñµÃĞÂÁ¬½ÓÊ±,ÆäËûEPOLLÏß³ÌÈÔÈ»¿ÉÄÜ´¦ÀíÒÑ¹Ø±ÕsocketµÄÊı¾İ    */
-            /*  1:epoll»ñÈ¡ÊÂ¼ş(°üº¬1fd)²¢×¼±¸ÉÔºó´¦Àí; 2:Âß¼­²ãclose 1fd¶ÔÓ¦µÄsession ; 3:¼àÌıÏß³ÌÊ¹ÓÃ¸ÕcloseµÄsession×÷ÎªĞÂÁ¬½Ó */
             struct server_s* server = &epollserver->base;
             session->fd = client_fd;
             buffer_init(session->recv_buffer);
             buffer_init(session->send_buffer);
             socket_nonblock(client_fd);
+            session->can_send = true;
 
             #ifdef PLATFORM_LINUX
-            epoll_add_event(epollserver, client_fd, session, EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+            epoll_add_event(epollserver, client_fd, session, EPOLLET | EPOLLIN | EPOLLOUT);
             #endif
 
             (*(server->logic_on_enter))(server, session->index);
         }
         else
         {
-            printf("Ã»ÓĞ¿ÉÓÃ×ÊÔ´\n");
+            printf("æ²¡æœ‰å¯ç”¨èµ„æº\n");
         }
     }
 }
@@ -133,7 +133,7 @@ static void epollserver_handle_sessionclose(struct session_s* session)
 
 }
 
-/*  ¼àÌıÏß³Ì,TODO::¿¼ÂÇÊÇ·ñÔÚacceptÇ°µÈ´ıÓĞ¿ÉÓÃ×ÊÔ´ */
+/*  TODO::è€ƒè™‘æ˜¯å¦æ ¹æ®å½“å‰å‰©ä½™sessionçš„ä¸ªæ•°æ¥è¿›è¡Œaccept   */
 static void epoll_listen_thread(void* arg)
 {
     struct epollserver_s* epollserver = (struct epollserver_s*)arg;
@@ -161,43 +161,77 @@ static void epoll_listen_thread(void* arg)
     }
 }
 
+/*  å‘é€å†…ç½®ç¼“å†²åŒºæœªå‘é€çš„æ•°æ® */
+static void epollserver_send_olddata(struct session_s* session)
+{
+    int send_len = 0;
+    struct buffer_s*    send_buffer = session->send_buffer;
+    int oldlen = buffer_getreadvalidcount(send_buffer);
+        
+    if(oldlen > 0)
+    {
+        send_len = socket_send(session->fd, buffer_getreadptr(send_buffer), oldlen);
+
+        if(send_len > 0)
+        {
+            buffer_addwritepos(send_buffer, send_len);
+        }
+        
+        session->can_send = (oldlen == oldlen);
+    }
+    
+    return;
+}
+
+/*  ä¼˜å…ˆå‘é€å†…ç½®ç¼“å†²åŒºæœªå‘é€çš„æ•°æ®,ç„¶åå‘é€æŒ‡å®šæ•°æ® */
 static int epollserver_senddata(struct session_s* session, const char* data, int len)
 {
     int send_len = 0;
     int oldlen = 0;
     int oldsendlen = 0;
     struct buffer_s*    send_buffer = session->send_buffer;
-
+    bool can_send = session->can_send;
+    
     mutex_lock(session->send_mutex);
-
-    oldlen = buffer_getreadvalidcount(send_buffer);
-
-    if(oldlen > 0)  /*  ÓÅÏÈ·¢ËÍÄÚÖÃ»º³åÇøÎ´·¢ËÍµÄÊı¾İ  */
+    
+    if(can_send)    /*  å¦‚æœå¯å†™åˆ™å‘é€å†…ç½®ç¼“å†²åŒºæ•°æ®,ç„¶åä»ç„¶å¯å†™åˆ™ç»§ç»­å‘é€æŒ‡å®šæ•°æ®  */
     {
-        oldsendlen = socket_send(session->fd, buffer_getreadptr(send_buffer), oldlen);
-
-        if(oldsendlen > 0)
+        epollserver_send_olddata(session);
+        
+        if(session->can_send)
         {
-            buffer_addwritepos(send_buffer, oldsendlen);
+            send_len = socket_send(session->fd, data, len);
+        }
+        
+        if(send_len < len)
+        {
+            session->can_send = false;  /*  è®¾ç½®ä¸ºä¸å¯å†™  */
         }
     }
-
-    if(oldsendlen == oldlen && NULL != data)    /*  Èç¹ûÊ£ÓàÊı¾İÈ«²¿·¢ËÍÍê±Ï,²Å·¢ËÍÓÃ»§¸ÕÖ¸¶¨µÄÊı¾İ */
+    
+    if(send_len < len)
     {
-        send_len = socket_send(session->fd, data, len);
-
-        if(send_len >= 0 && send_len < len) /*  Èç¹û·¢ËÍÃ»ÓĞÊ§°Ü,µ«Ã»ÓĞÈ«²¿·¢Íê,ÔòĞ´ÈëÄÚÖÃ»º³åÇø */
+        if(buffer_write(send_buffer, data+send_len, len-send_len))
         {
-            if(buffer_write(session->send_buffer, data+send_len, len-send_len))
-            {
-                send_len = len;
-            }
+            send_len = len;
         }
     }
-
+    
     mutex_unlock(session->send_mutex);
 
     return send_len;
+}
+
+static void epoll_handle_onoutevent(struct session_s* session)
+{
+    session->can_send = true;
+    
+    if(buffer_getreadvalidcount(session->send_buffer) > 0)
+    {
+        mutex_lock(session->send_mutex);
+        epollserver_send_olddata(session);
+        mutex_unlock(session->send_mutex);
+    }
 }
 
 static void epoll_work_thread(void* arg)
@@ -227,23 +261,14 @@ static void epoll_work_thread(void* arg)
             struct session_s*   session = (struct session_s*)(events[i].data.ptr);
             event_data = events[i].events;
 
-            if(event_data & EPOLLRDHUP)
+            if(event_data & EPOLLIN)
             {
-                printf("client disconnet \n");
-                epollserver_handle_sessionclose(session);
-                (*server->logic_on_close)(server, session->index);
+                thread_pool_pushmsg(epollserver->recv_thread_pool, session);
             }
-            else
-            {
-                if(event_data & EPOLLIN)
-                {
-                    thread_pool_pushmsg(epollserver->recv_thread_pool, session);
-                }
 
-                if(event_data & EPOLLOUT)
-                {
-                    epollserver_senddata(session, NULL, 0);
-                }
+            if(event_data & EPOLLOUT)
+            {
+                epoll_handle_onoutevent(session);
             }
         }
     }
@@ -251,9 +276,7 @@ static void epoll_work_thread(void* arg)
     #endif
 }
 
-/*  Ïß³Ì³ØÏûÏ¢´¦Àíº¯Êı:¶ÁÈ¡Êı¾İ */
-/*  TODO::ĞèÒª¿¼ÂÇÄÚÖÃ½ÓÊÕ»º³åÇøÒÑÂú,µ¼ÖÂ¿ÉÄÜÃ»ÓĞÈ«²¿½ÓÊÜµÄÇé¿ö(EPOLLµÄETÄ£Ê½ÏÂÖ»Í¨ÖªÒ»ÏÂ) */
-/*  TODO::µ«ÕâÖÖ¿ÉÄÜĞÔÓĞ¶à´óÄØ?³ı·ÇÂß¼­²ãÌ«ÂıÌ«ÂıÁË */
+
 
 static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 {
@@ -263,13 +286,12 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 
     bool is_close = false;
 
-    /*  Ñ­»·¶ÁÈ¡:Ö±µ½²úÉúS_EWOULDBLOCK,»òÕßrecvÊ§°Ü */
     for(;;)
     {
         int can_recvlen = 0;
         int recv_len = 0;
 
-        if(buffer_getwritevalidcount(recv_buffer) <= 0) /*  Èç¹ûÊı¾İÈ«²¿´¦ÓÚÎ²²¿,ÔòÒÆ¶¯µ½Í·²¿    */
+        if(buffer_getwritevalidcount(recv_buffer) <= 0)
         {
             buffer_adjustto_head(recv_buffer);
         }
@@ -278,7 +300,7 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 
         if(can_recvlen <= 0)
         {
-            break;  /*  TODO::¼ûº¯ÊıÉùÃ÷µÄ×¢ÊÍ  */
+            break;
         }
 
         recv_len = recv(session->fd, buffer_getwriteptr(recv_buffer), can_recvlen, 0);
@@ -346,6 +368,7 @@ static void epollserver_start_callback(
         }
     }
 
+    /*  å¼€å¯epoll_waitçº¿ç¨‹ç»„ */
     epollserver->epoll_threads = (struct thread_s**)malloc(sizeof(struct thread_s*)*EPOLL_WORKTHREAD_NUM);
 
     {
@@ -356,9 +379,11 @@ static void epollserver_start_callback(
         }
     }
 
+    /*  å¼€å¯recvçº¿ç¨‹æ±    */
     epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 1024);
     thread_pool_start(epollserver->recv_thread_pool);
 
+    /*  å¼€å¯ç›‘å¬çº¿ç¨‹  */
     epollserver->listen_thread = thread_new(epoll_listen_thread, epollserver);
 }
 

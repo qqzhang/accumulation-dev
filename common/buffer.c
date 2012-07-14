@@ -148,7 +148,7 @@ bool buffer_write(struct buffer_s* self, const char* data, int len)
 
     if(buffer_getwritevalidcount(self) >= len)
     {
-        // 不用移动缓冲区即可从后面全部写入
+        /*  鐩存帴鍐欏叆    */
         memcpy(buffer_getwriteptr(self), data, len);
         buffer_addwritepos(self, len);
     }
@@ -157,7 +157,6 @@ bool buffer_write(struct buffer_s* self, const char* data, int len)
         int left_len = self->data_len-buffer_getreadvalidcount(self);
         if(left_len >= len)
         {
-            // 需要移动已写缓冲区到头部,再写入数据
             buffer_adjustto_head(self);
             buffer_write(self, data, len);
         }
