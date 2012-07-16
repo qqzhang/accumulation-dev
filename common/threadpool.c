@@ -11,19 +11,18 @@
 
 struct thread_pool_s
 {
-    bool    is_run;
+    bool is_run;
 
     struct stack_s* msg_list;
 
     struct mutex_s* msg_lock;
 
     struct thread_s** work_threads;
-    bool*    work_thread_state;
+    bool* work_thread_state;
 
-    struct mutex_s* lock;
     struct thread_cond_s* cv;
 
-    thread_msg_fun_pt   callback;
+    thread_msg_fun_pt callback;
     int work_thread_num;
 
     int thread_index;
@@ -35,8 +34,7 @@ struct thread_pool_s* thread_pool_new(thread_msg_fun_pt callback, int thread_num
     struct thread_pool_s* ret = (struct thread_pool_s*)malloc(sizeof(*ret));
     ret->msg_list = stack_new(msg_num,sizeof(void*));
     ret->msg_lock = mutex_new();
-
-    ret->lock = mutex_new();
+    
     ret->cv = thread_cond_new();
 
     ret->callback = callback;
@@ -67,9 +65,6 @@ void thread_pool_delete(struct thread_pool_s* self)
 
     free(self->work_threads);
 
-    mutex_delete(self->lock);
-    self->lock = NULL;
-    
     thread_cond_delete(self->cv);
     self->cv = 0;
 
@@ -80,64 +75,45 @@ void thread_pool_delete(struct thread_pool_s* self)
     self = NULL;
 }
 
-// TODO::Ïß³Ì¼¤»îÊ±Ö»´¦ÀíÒ»ÌõÏûÏ¢
-
-// TODO::»òĞíÓ¦¸ÃÎªÏß³Ì³ØÌí¼ÓÒ»¸ö±êÖ¾,±íÊ¾ÊÇ·ñÒ»¸öÏß³Ì¼¤»îÊ±»ñÈ¡µ±Ç°stackËùÓĞÏûÏ¢½øĞĞ´¦Àí
-// TODO::»¹ÊÇÖ»´¦ÀíÒ»ÌõÏûÏ¢
-
-static void thread_pool_proc_onemsg(struct thread_pool_s* self)
-{
-    thread_msg_fun_pt callback = self->callback;
-    void** msg_ptr = 0;
-
-    mutex_lock(self->msg_lock);
-    msg_ptr = (void**)stack_pop(self->msg_list);
-    mutex_unlock(self->msg_lock);
-
-    if(NULL != msg_ptr)
-    {
-        (*callback)(self, *msg_ptr);
-    }
-}
-
 static void thread_pool_work(void* arg)
 {
     struct thread_pool_s* self = (struct thread_pool_s*)arg;
     struct stack_s* msg_list = self->msg_list;
     int thread_index = 0;
     bool* thread_state = self->work_thread_state;
-
+    
+    thread_msg_fun_pt callback = self->callback;
+    void** msg_ptr = NULL;
+    
     mutex_lock(self->thread_index_lock);
     thread_index = self->thread_index++;
     mutex_unlock(self->thread_index_lock);
 
     for(;;)
     {
-        if(stack_top(msg_list) <= 0)
+        mutex_lock(self->msg_lock);
+        
+        while(self->is_run && stack_top(msg_list) <= 0)
         {
-            // Èç¹ûÃ»ÓĞÏûÏ¢,Ôò½øÈëÍ¬²½Âß¼­
-
-            mutex_lock(self->lock);
-
-            if(!self->is_run)
-            {
-                mutex_unlock(self->lock);
-                break;
-            }
-            
-            // µ±»ñÈ¡Ëø³É¹¦ºóÔÙ´ÎÅĞ¶ÏÊÇ·ñÓĞÏûÏ¢,Èç¹ûÈÔÈ»Ã»ÓĞÏûÏ¢²Å½øĞĞµÈ´ıÌõ¼ş±äÁ¿
-            // ÒÔ×î´óÏŞ¶ÈÀûÓÃ¶à¸öÏß³Ì¹¤×÷
-            if(stack_top(msg_list) <= 0)
-            {
-                thread_cond_wait(self->cv, self->lock);
-            }
-
-            mutex_unlock(self->lock);
+            thread_cond_wait(self->cv, self->msg_lock);
         }
-
+        
+        if(!self->is_run)
+        {
+            mutex_unlock(self->msg_lock);
+            break;
+        }
+        
+        msg_ptr = (void**)stack_pop(self->msg_list);
+        
+        mutex_unlock(self->msg_lock);
+        
         thread_state[thread_index] = true;
 
-        thread_pool_proc_onemsg(self);
+        if(NULL != msg_ptr)
+        {
+            (*callback)(self, *msg_ptr);
+        }
 
         thread_state[thread_index] = false;
     }
@@ -178,7 +154,7 @@ void thread_pool_stop(struct thread_pool_s* self)
     }
 }
 
-// ¼ì²âÏß³Ì³ØÊÇ·ñÃ¦(Ã»ÓĞ´¦ÀíÍêËùÓĞÏûÏ¢)
+// æ£€æµ‹çº¿ç¨‹æ± æ˜¯å¦å¿™(æ²¡æœ‰å¤„ç†å®Œæ‰€æœ‰æ¶ˆæ¯)
 static bool thread_pool_isbusy(struct thread_pool_s* self)
 {
     bool isbusy = false;
@@ -207,7 +183,7 @@ static bool thread_pool_isbusy(struct thread_pool_s* self)
 
 void thread_pool_wait(struct thread_pool_s* self)
 {
-    // Ñ­»·µÈ´ıÏß³Ì³Ø,Ö±µ½Æä´¦ÓÚ·ÇÃ¦×´Ì¬
+    // å¾ªç¯ç­‰å¾…çº¿ç¨‹æ± ,ç›´åˆ°å…¶å¤„äºéå¿™çŠ¶æ€
     for(;;)
     {
         if(!thread_pool_isbusy(self))
@@ -221,12 +197,15 @@ void thread_pool_wait(struct thread_pool_s* self)
 
 void thread_pool_pushmsg(struct thread_pool_s* self, void* data)
 {
-    // Ìí¼ÓÏûÏ¢,²¢´¥·¢Ìõ¼ş±äÁ¿
+    // æ·»åŠ æ¶ˆæ¯,å¹¶è§¦å‘æ¡ä»¶å˜é‡
 
     if(self->is_run)
     {
         mutex_lock(self->msg_lock);
-        stack_push(self->msg_list, &data);
+        if(!stack_push(self->msg_list, &data))
+        {
+            printf("thread pool stack_push failed\n");
+        }
         mutex_unlock(self->msg_lock);
 
         thread_cond_signal(self->cv);

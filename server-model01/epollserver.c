@@ -2,6 +2,7 @@
 
 #ifdef PLATFORM_LINUX
 #include <sys/epoll.h>
+#include <signal.h>
 #ifndef EPOLLRDHUP
     #define EPOLLRDHUP (0x2000)
     #endif
@@ -20,7 +21,7 @@
 #include "server_private.h"
 #include "buffer.h"
 
-#define EPOLL_WORKTHREAD_NUM (1)    /*  epoll_wait线程个数; recv线程池的工作线程个数  */
+#define EPOLL_WORKTHREAD_NUM (2)    /*  epoll_wait线程个数; recv线程池的工作线程个数  */
 
 #define MAX_EVENTS (50)
 
@@ -32,9 +33,10 @@ struct session_s
     int index;
     sock fd;
 
-    bool    can_send;               /*  是否可写    */
+    bool    writeable;               /*  是否可写    */
     struct mutex_s*  send_mutex;    /*  TODO::考虑使用自旋锁   */
     struct buffer_s*    send_buffer;
+    struct mutex_s* recv_mutex;
     struct buffer_s*    recv_buffer;
 };
 
@@ -97,13 +99,13 @@ static void epoll_handle_newclient(struct epollserver_s* epollserver, sock clien
             buffer_init(session->recv_buffer);
             buffer_init(session->send_buffer);
             socket_nonblock(client_fd);
-            session->can_send = true;
-
-            #ifdef PLATFORM_LINUX
-            epoll_add_event(epollserver, client_fd, session, EPOLLET | EPOLLIN | EPOLLOUT);
-            #endif
+            session->writeable = true;
 
             (*(server->logic_on_enter))(server, session->index);
+            
+            #ifdef PLATFORM_LINUX
+            epoll_add_event(epollserver, client_fd, session, EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+            #endif
         }
         else
         {
@@ -143,21 +145,31 @@ static void epoll_listen_thread(void* arg)
     socklen_t size = sizeof(struct sockaddr);
 
     sock listen_fd = socket_listen(epollserver->listen_port, 25);
-
-    for(;;)
+    
+    if(SOCKET_ERROR != listen_fd)
     {
-        while((client_fd = accept(listen_fd, (struct sockaddr*)&socketaddress, &size)) < 0)
+        for(;;)
         {
-            if(EINTR == sErrno)
+            while((client_fd = accept(listen_fd, (struct sockaddr*)&socketaddress, &size)) < 0)
             {
-                continue;
+                if(EINTR == sErrno)
+                {
+                    continue;
+                }
+            }
+
+            if(SOCKET_ERROR != client_fd)
+            {
+                epoll_handle_newclient(epollserver, client_fd);
             }
         }
-
-        if(SOCKET_ERROR != client_fd)
-        {
-            epoll_handle_newclient(epollserver, client_fd);
-        }
+        
+        socket_close(listen_fd);
+        listen_fd = SOCKET_ERROR;
+    }
+    else
+    {
+        printf("listen failed\n");
     }
 }
 
@@ -177,7 +189,7 @@ static void epollserver_send_olddata(struct session_s* session)
             buffer_addwritepos(send_buffer, send_len);
         }
         
-        session->can_send = (oldlen == oldlen);
+        session->writeable = (oldlen == oldlen);
     }
     
     return;
@@ -190,22 +202,22 @@ static int epollserver_senddata(struct session_s* session, const char* data, int
     int oldlen = 0;
     int oldsendlen = 0;
     struct buffer_s*    send_buffer = session->send_buffer;
-    bool can_send = session->can_send;
+    bool writeable = session->writeable;
     
     mutex_lock(session->send_mutex);
     
-    if(can_send)    /*  如果可写则发送内置缓冲区数据,然后仍然可写则继续发送指定数据  */
+    if(writeable)    /*  如果可写则发送内置缓冲区数据,然后仍然可写则继续发送指定数据  */
     {
         epollserver_send_olddata(session);
         
-        if(session->can_send)
+        if(session->writeable)
         {
             send_len = socket_send(session->fd, data, len);
         }
         
         if(send_len < len)
         {
-            session->can_send = false;  /*  设置为不可写  */
+            session->writeable = false;  /*  设置为不可写  */
         }
     }
     
@@ -224,7 +236,7 @@ static int epollserver_senddata(struct session_s* session, const char* data, int
 
 static void epoll_handle_onoutevent(struct session_s* session)
 {
-    session->can_send = true;
+    session->writeable = true;
     
     if(buffer_getreadvalidcount(session->send_buffer) > 0)
     {
@@ -250,7 +262,6 @@ static void epoll_work_thread(void* arg)
     {
         nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
 
-        printf("recv %d event\n", nfds);
         if(-1 == nfds)
         {
             break;
@@ -260,9 +271,12 @@ static void epoll_work_thread(void* arg)
         {
             struct session_s*   session = (struct session_s*)(events[i].data.ptr);
             event_data = events[i].events;
-
+            
             if(event_data & EPOLLIN)
             {
+                /*  当此线程获得fd的可读事件后投递,然而此事件未处理之前,另外的线程又获取了fd的新可读通知
+                 *  那么线程池的消息队列里将会有fd的多个可读消息
+                 *  TODO::可以考虑优化    */
                 thread_pool_pushmsg(epollserver->recv_thread_pool, session);
             }
 
@@ -276,16 +290,17 @@ static void epoll_work_thread(void* arg)
     #endif
 }
 
-
-
+/*  多线程epoll_wait时会在多个线程触发epollin事件,从来recv处理函数会存在线程安全问题,故加锁处理 */
+/*  TODO::对于锁的加锁位置设计需要仔细考虑  */
 static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 {
     struct session_s*   session = (struct session_s*)msg;
     struct buffer_s*    recv_buffer = session->recv_buffer;
     struct server_s*    server = &(session->epollserver->base);
-
+    int all_recvlen = 0;
     bool is_close = false;
-
+    mutex_lock(session->recv_mutex);
+    
     for(;;)
     {
         int can_recvlen = 0;
@@ -312,10 +327,15 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
         else if(SOCKET_ERROR == recv_len)
         {
             is_close = (S_EWOULDBLOCK != sErrno);
+            /*  当客户端多次send时,EPOLL对同一个FD返回会多次EPOLLIN，然而第一个消息被处理时全部读入数据
+             *  然后后面的消息被处理时则不能读入数据,于是返回失败
+             *  TODO::见thread_pool_pushmsg的注释
+             */
             break;
         }
         else
         {
+            all_recvlen += recv_len;
             buffer_addwritepos(recv_buffer, recv_len);
         }
     }
@@ -325,11 +345,13 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
         epollserver_handle_sessionclose(session);
         (*server->logic_on_close)(server, session->index);
     }
-    else
+    else if(all_recvlen > 0)
     {
         int proc_len = (*server->logic_on_recved)(server, session->index, buffer_getreadptr(recv_buffer), buffer_getreadvalidcount(recv_buffer));
         buffer_addreadpos(recv_buffer, proc_len);
     }
+    
+    mutex_unlock(session->recv_mutex);
 }
 
 static void epollserver_start_callback(
@@ -362,6 +384,7 @@ static void epollserver_start_callback(
 
             session->send_mutex = mutex_new();
             session->send_buffer = buffer_new(epollserver->session_sendbuffer_size);
+            session->recv_mutex = mutex_new();
             session->recv_buffer = buffer_new(epollserver->session_recvbuffer_size);
 
             stack_push(epollserver->freelist, &session);
@@ -379,8 +402,9 @@ static void epollserver_start_callback(
         }
     }
 
+    /*  TODO::线程池的消息队列上限需要考虑拿给客户指定,如果太小则会导致事件处理不了  */
     /*  开启recv线程池   */
-    epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 1024);
+    epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 10240);
     thread_pool_start(epollserver->recv_thread_pool);
 
     /*  开启监听线程  */
@@ -440,6 +464,6 @@ struct server_s* epollserver_create(
 #ifdef PLATFORM_LINUX
     epollserver->epoll_fd = epoll_create(1);
 #endif
-
+    signal(SIGPIPE, SIG_IGN);
     return &epollserver->base;
 }
