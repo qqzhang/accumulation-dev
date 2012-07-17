@@ -101,6 +101,7 @@ static void thread_pool_work(void* arg)
         if(!self->is_run)
         {
             mutex_unlock(self->msg_lock);
+            thread_cond_signal(self->cv);
             break;
         }
         
@@ -139,13 +140,11 @@ void thread_pool_stop(struct thread_pool_s* self)
         int i = 0;
         self->is_run = false;
 
-        thread_cond_signal(self->cv);
-
-        i = 0;
         for(; i < self->work_thread_num; ++i)
         {
             if(NULL != self->work_threads[i])
             {
+                thread_cond_signal(self->cv);
                 thread_delete(self->work_threads[i]);
             }
         }
@@ -195,19 +194,22 @@ void thread_pool_wait(struct thread_pool_s* self)
     }
 }
 
-void thread_pool_pushmsg(struct thread_pool_s* self, void* data)
+bool thread_pool_pushmsg(struct thread_pool_s* self, void* data)
 {
     // 添加消息,并触发条件变量
-
+    bool push_ret = false;
+    
     if(self->is_run)
     {
         mutex_lock(self->msg_lock);
-        if(!stack_push(self->msg_list, &data))
+        if(stack_push(self->msg_list, &data))
         {
-            printf("thread pool stack_push failed\n");
+            push_ret = true;
         }
         mutex_unlock(self->msg_lock);
 
         thread_cond_signal(self->cv);
     }
+    
+    return push_ret;
 }

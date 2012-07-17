@@ -110,7 +110,9 @@ void thread_cond_delete(struct thread_cond_s* self)
 void thread_cond_wait(struct thread_cond_s* self, struct mutex_s* mutex)
 {
 #if defined PLATFORM_WINDOWS
+    mutex_unlock(mutex);
     WaitForSingleObject(self->cond, INFINITE);
+    mutex_lock(mutex);
 #else
     pthread_cond_wait(&self->cond, &mutex->mutex);
 #endif
