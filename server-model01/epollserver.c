@@ -246,6 +246,8 @@ static void epoll_handle_onoutevent(struct session_s* session)
     }
 }
 
+static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg);
+
 static void epoll_work_thread(void* arg)
 {
     #ifdef PLATFORM_LINUX
@@ -261,10 +263,16 @@ static void epoll_work_thread(void* arg)
     for(;;)
     {
         nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
-
         if(-1 == nfds)
         {
-            break;
+            if(S_EINTR == sErrno)
+            {
+                continue;
+            }
+            else
+            {
+                break;
+            }
         }
 
         for(i = 0; i < nfds; ++i)
@@ -278,6 +286,11 @@ static void epoll_work_thread(void* arg)
                  *  那么线程池的消息队列里将会有fd的多个可读消息
                  *  TODO::可以考虑优化    */
                 thread_pool_pushmsg(epollserver->recv_thread_pool, session);
+                
+                /*
+                TODO::可以直接recv数据而非发送事件到线程池
+                * */
+                /*  epoll_recvdata_callback(NULL, session); */
             }
 
             if(event_data & EPOLLOUT)
@@ -299,7 +312,14 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
     struct server_s*    server = &(session->epollserver->base);
     int all_recvlen = 0;
     bool is_close = false;
+    
+    bool proc_begin = false;
+    
     mutex_lock(session->recv_mutex);
+
+procbegin:
+    proc_begin = false;
+    all_recvlen = 0;
     
     for(;;)
     {
@@ -315,6 +335,11 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
 
         if(can_recvlen <= 0)
         {
+            /*
+            TODO::设置再处理标志(逻辑层处理之后继续recv),可以处理客户端发送大量数据导致服务器
+             有接收完客户端之前发送的数据,从而客户端后面预发送的数据一直发送不成功
+             * */
+            proc_begin = true;
             break;
         }
 
@@ -343,6 +368,12 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
     if(is_close)
     {
         epollserver_handle_sessionclose(session);
+        
+        /*
+        TODO::有了proc_begin设计的情况下,或许得考虑在logic_on_recved中逻辑层已经调用了closesession接口
+        而现在又回调逻辑层的close处理函数,那么逻辑层必须得设置标志处理这种情况
+        以及网络层closesession和逻辑层closesession同时发生的情况
+        * */
         (*server->logic_on_close)(server, session->index);
     }
     else if(all_recvlen > 0)
@@ -351,6 +382,11 @@ static void epoll_recvdata_callback(struct thread_pool_s* self, void* msg)
         buffer_addreadpos(recv_buffer, proc_len);
     }
     
+    if(proc_begin)
+    {
+        goto procbegin;
+    }
+
     mutex_unlock(session->recv_mutex);
 }
 
@@ -404,7 +440,7 @@ static void epollserver_start_callback(
 
     /*  TODO::线程池的消息队列上限需要考虑拿给客户指定,如果太小则会导致事件处理不了  */
     /*  开启recv线程池   */
-    epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 10240);
+    epollserver->recv_thread_pool = thread_pool_new(epoll_recvdata_callback, EPOLL_WORKTHREAD_NUM, 102400);
     thread_pool_start(epollserver->recv_thread_pool);
 
     /*  开启监听线程  */
