@@ -7,8 +7,8 @@ extern "C" {
 
     struct server_s;
 
-    //  session_recvbuffer_size : ÄÚÖÃ½ÓÊÕ»º³åÇø´óĞ¡
-    //  session_sendbuffer_size : ÄÚÖÃ·¢ËÍ»º³åÇø´óĞ¡(´æ·ÅÍ¶µİÎ´³É¹¦µÄÊı¾İ)
+    //  session_recvbuffer_size :   å†…ç½®æ¥æ”¶ç¼“å†²åŒºå¤§å°
+    //  session_sendbuffer_size :   å†…ç½®å‘é€ç¼“å†²åŒºå¤§å°(ä¿å­˜ç›´æ¥æŠ•é€’æœªæˆåŠŸçš„æ•°æ®)   
 
     struct server_s* epollserver_create(
         int port, 
