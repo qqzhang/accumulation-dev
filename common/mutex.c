@@ -28,6 +28,10 @@ struct thread_cond_s
 
 };
 
+struct thread_spinlock_s
+{
+    pthread_spinlock_t spinlock;
+};
 
 struct mutex_s* mutex_new()
 {
@@ -125,5 +129,32 @@ void thread_cond_signal(struct thread_cond_s* self)
 #else
     pthread_cond_signal(&self->cond);
 #endif
+}
+
+struct thread_spinlock_s* thread_spinlock_new()
+{
+    struct thread_spinlock_s* ret = (struct thread_spinlock_s*)malloc(sizeof(*ret));
+    if(NULL != ret)
+    {
+        pthread_spin_init(&ret->spinlock, 0);
+    }
+
+    return ret;    
+}
+
+void thread_spinlock_delete(struct thread_spinlock_s* self)
+{
+    pthread_spin_destroy(&self->spinlock);
+    free(self);
+}
+
+void thread_spinlock_lock(struct thread_spinlock_s* self)
+{
+    pthread_spin_lock(&self->spinlock);
+}
+
+void thread_spinlock_unlock(struct thread_spinlock_s* self)
+{
+    pthread_spin_unlock(&self->spinlock);
 }
 
